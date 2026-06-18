@@ -1,0 +1,98 @@
+import cv2
+import numpy as np
+import socket
+import json
+import time
+import math
+import threading
+
+LOCAL_IP = "0.0.0.0"
+LOCAL_PORT = 9005
+
+TARGET_IP = "192.168.31.202"
+TARGET_PORT = 9005
+
+CAMERA_ID = 0 # 请确保此处适配你系统下的设备路径，或在调用时传入 "/dev/video-camera0"
+CAMERA_W = 1920
+CAMERA_H = 1200
+CAMERA_FPS = 30
+
+DISPLAY_W = 960
+DISPLAY_H = 600
+
+ROI_MARGIN = 300
+LOST_FULL_SCAN_AFTER = 5
+FULL_SCAN_INTERVAL = 1.5
+
+SEND_INTERVAL = 0.04
+PRINT_INTERVAL = 1.0
+
+PHYSICAL_POINTS = {
+    10: [0, 0],
+    13: [399, 0],
+    12: [399, 449],
+    11: [0, 449],
+}
+FIELD_W, FIELD_H = 399, 449
+
+class LatestCamera:
+    def __init__(self, camera_id, width, height, fps):
+        # 建议：如果程序报错无法打开节点，可尝试此处改为 self.cap = cv2.VideoCapture("/dev/video-camera0", cv2.CAP_V4L2)
+        self.cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.lock = threading.Lock()
+        self.frame = None
+        self.frame_time = 0.0
+        self.frame_id = 0
+        self.running = True
+
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.005)
+                continue
+
+            now = time.perf_counter()
+            with self.lock:
+                self.frame = frame
+                self.frame_time = now
+                self.frame_id += 1
+
+    def read_latest(self):
+        with self.lock:
+            if self.frame is None:
+                return False, None, 0.0, 0
+            return True, self.frame.copy(), self.frame_time, self.frame_id
+
+    def release(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+        self.cap.release()
+
+# ... [省略辅助函数 detect_markers_roi, get_bev_point 等，逻辑保持不变] ...
+
+# 在发送位置的 payload 部分：
+                                    if now - last_send_time >= SEND_INTERVAL:
+                                        payload = {
+                                            "type": "robot_position",
+                                            "pos": [x_m, 0.14, z_m],  # 高度已修改为 0.14
+                                            "euler": [0.0, real_yaw, 0.0],
+                                        }
+
+                                        try:
+                                            json_str = json.dumps(payload)
+                                            udp_socket.sendto(
+                                                json_str.encode("utf-8"),
+                                                (TARGET_IP, TARGET_PORT)
+                                            )
+                                            last_send_time = now
+                                            # ... [后续代码保持不变]

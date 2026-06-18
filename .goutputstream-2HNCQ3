@@ -1,0 +1,426 @@
+import cv2
+import numpy as np
+import socket
+import json
+import time
+import math
+import threading
+
+LOCAL_IP = "0.0.0.0"
+LOCAL_PORT = 9005
+
+TARGET_IP = "192.168.31.202"
+TARGET_PORT = 9005
+
+CAMERA_ID = 0
+CAMERA_W = 1920
+CAMERA_H = 1200
+CAMERA_FPS = 30
+
+# 只降低显示窗口，不降低检测分辨率
+DISPLAY_W = 640
+DISPLAY_H = 400
+
+ROI_MARGIN = 240
+LOST_FULL_SCAN_AFTER = 5
+FULL_SCAN_INTERVAL = 3.0
+
+SEND_INTERVAL = 0.04
+PRINT_INTERVAL = 1.0
+
+PHYSICAL_POINTS = {
+    10: [0, 0],
+    13: [399, 0],
+    12: [399, 449],
+    11: [0, 449],
+}
+FIELD_W, FIELD_H = 399, 449
+
+
+class LatestCamera:
+    def __init__(self, camera_id, width, height, fps):
+        self.cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("M", "J", "P", "G"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.lock = threading.Lock()
+        self.frame = None
+        self.frame_time = 0.0
+        self.frame_id = 0
+        self.running = True
+
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.005)
+                continue
+
+            now = time.perf_counter()
+            with self.lock:
+                self.frame = frame
+                self.frame_time = now
+                self.frame_id += 1
+
+    def read_latest(self):
+        with self.lock:
+            if self.frame is None:
+                return False, None, 0.0, 0
+            return True, self.frame, self.frame_time, self.frame_id
+
+    def release(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+        self.cap.release()
+
+
+def clamp_roi(x1, y1, x2, y2, width, height):
+    x1 = max(0, min(int(x1), width - 1))
+    y1 = max(0, min(int(y1), height - 1))
+    x2 = max(1, min(int(x2), width))
+    y2 = max(1, min(int(y2), height))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return x1, y1, x2, y2
+
+
+def make_roi_from_marker(marker_corner, frame_shape, margin):
+    height, width = frame_shape[:2]
+    c = marker_corner[0]
+
+    x1 = np.min(c[:, 0]) - margin
+    y1 = np.min(c[:, 1]) - margin
+    x2 = np.max(c[:, 0]) + margin
+    y2 = np.max(c[:, 1]) + margin
+
+    return clamp_roi(x1, y1, x2, y2, width, height)
+
+
+def detect_markers_roi(frame, aruco_dict, params, roi=None):
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        crop = frame[y1:y2, x1:x2]
+        work_img = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        offset = np.array([[[x1, y1]]], dtype=np.float32)
+    else:
+        work_img = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        offset = np.array([[[0, 0]]], dtype=np.float32)
+
+    corners, ids, rejected = cv2.aruco.detectMarkers(
+        work_img,
+        aruco_dict,
+        parameters=params
+    )
+
+    if corners is not None:
+        corners = [c + offset for c in corners]
+
+    return corners, ids, rejected
+
+
+def get_bev_point(u, v, matrix):
+    point = np.array([u, v, 1.0], dtype=np.float32).reshape(3, 1)
+    transformed = np.dot(matrix, point)
+    w = transformed[2, 0]
+
+    if w == 0:
+        return None
+
+    return float(transformed[0, 0] / w), float(transformed[1, 0] / w)
+
+
+def draw_minimap_display(img, car_x, car_y):
+    map_w, map_h = 180, 200
+    margin_x = img.shape[1] - map_w - 10
+    margin_y = 20
+
+    x1 = margin_x
+    y1 = margin_y
+    x2 = x1 + map_w
+    y2 = y1 + map_h
+
+    overlay = img[y1:y2, x1:x2].copy()
+    cv2.rectangle(overlay, (0, 0), (map_w, map_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, img[y1:y2, x1:x2], 0.45, 0, img[y1:y2, x1:x2])
+
+    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 1)
+
+    for i in range(1, 4):
+        gx = x1 + int((i * 100) / FIELD_W * map_w)
+        cv2.line(img, (gx, y1), (gx, y2), (90, 90, 90), 1)
+
+    for i in range(1, 5):
+        gy = y1 + int((i * 100) / FIELD_H * map_h)
+        cv2.line(img, (x1, gy), (x2, gy), (90, 90, 90), 1)
+
+    cv2.putText(img, "MAP", (x1 + 6, y1 + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    if car_x is not None and car_y is not None:
+        px = max(0, min(car_x, FIELD_W))
+        py = max(0, min(car_y, FIELD_H))
+
+        map_px = x1 + int((px / FIELD_W) * map_w)
+        map_py = y1 + int((py / FIELD_H) * map_h)
+
+        cv2.circle(img, (map_px, map_py), 6, (0, 0, 255), -1)
+        cv2.putText(img, "CAR", (map_px + 7, map_py + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+
+cv2.setUseOptimized(True)
+
+udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_socket.bind((LOCAL_IP, LOCAL_PORT))
+print(f"UDP ready -> target {TARGET_IP}:{TARGET_PORT}")
+
+custom_params = cv2.aruco.DetectorParameters_create()
+custom_params.minMarkerPerimeterRate = 0.01
+custom_params.polygonalApproxAccuracyRate = 0.06
+
+dict_car = cv2.aruco.Dictionary_get(cv2.aruco.DICT_APRILTAG_16h5)
+dict_base = cv2.aruco.Dictionary_get(cv2.aruco.DICT_APRILTAG_36h11)
+
+camera = LatestCamera(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS)
+
+print("--- Low Display Resolution Tracker start ---")
+print(f"Camera detect: {CAMERA_W}x{CAMERA_H}")
+print(f"Display: {DISPLAY_W}x{DISPLAY_H}")
+
+M_matrix = None
+is_calibrated = False
+base_cache = {}
+
+car_roi = None
+lost_count = 0
+last_full_scan_time = 0.0
+
+fps = 0.0
+fps_count = 0
+fps_t0 = time.perf_counter()
+
+last_send_time = 0.0
+last_print_time = 0.0
+last_processed_frame_id = -1
+
+try:
+    while True:
+        ok, frame, frame_time, frame_id = camera.read_latest()
+
+        if not ok:
+            time.sleep(0.005)
+            continue
+
+        if frame_id == last_processed_frame_id:
+            time.sleep(0.001)
+            continue
+
+        last_processed_frame_id = frame_id
+        now = time.perf_counter()
+        delay_ms = (now - frame_time) * 1000.0
+
+        car_x_cm, car_y_cm = None, None
+        scan_mode = "CAL"
+
+        if not is_calibrated:
+            corners_base, ids_base, _ = detect_markers_roi(
+                frame,
+                dict_base,
+                custom_params,
+                roi=None
+            )
+
+            if ids_base is not None:
+                cv2.aruco.drawDetectedMarkers(frame, corners_base, ids_base)
+
+                for i in range(len(ids_base)):
+                    tid = ids_base[i][0]
+
+                    if tid in PHYSICAL_POINTS:
+                        c = corners_base[i][0]
+                        cx, cy = np.mean(c[:, 0]), np.mean(c[:, 1])
+                        base_cache[tid] = [cx, cy]
+
+            cv2.putText(frame, f"Calibrating: Found {len(base_cache)}/4",
+                        (40, 80), cv2.FONT_HERSHEY_SIMPLEX, 2,
+                        (0, 165, 255), 4)
+
+            if len(base_cache) == 4:
+                src_pts = np.array([
+                    base_cache[11],
+                    base_cache[12],
+                    base_cache[13],
+                    base_cache[10],
+                ], dtype=np.float32)
+
+                dst_pts = np.array([
+                    PHYSICAL_POINTS[11],
+                    PHYSICAL_POINTS[12],
+                    PHYSICAL_POINTS[13],
+                    PHYSICAL_POINTS[10],
+                ], dtype=np.float32)
+
+                M_matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                is_calibrated = True
+                print("Calibration done.")
+
+        else:
+            cv2.putText(frame, "SYSTEM READY", (40, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 2,
+                        (0, 255, 0), 4)
+
+            need_full_scan = (
+                car_roi is None
+                or lost_count >= LOST_FULL_SCAN_AFTER
+                or now - last_full_scan_time >= FULL_SCAN_INTERVAL
+            )
+
+            if need_full_scan:
+                search_roi = None
+                scan_mode = "FULL"
+                last_full_scan_time = now
+            else:
+                search_roi = car_roi
+                scan_mode = "ROI"
+
+            if search_roi is not None:
+                x1, y1, x2, y2 = search_roi
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 180, 0), 2)
+
+            corners_car, ids_car, _ = detect_markers_roi(
+                frame,
+                dict_car,
+                custom_params,
+                roi=search_roi
+            )
+
+            found_car = False
+
+            if ids_car is not None:
+                for i in range(len(ids_car)):
+                    if ids_car[i][0] == 1:
+                        found_car = True
+
+                        cv2.aruco.drawDetectedMarkers(
+                            frame,
+                            [corners_car[i]],
+                            np.array([[1]], dtype=np.int32)
+                        )
+
+                        c = corners_car[i][0]
+                        cx, cy = np.mean(c[:, 0]), np.mean(c[:, 1])
+
+                        car_roi = make_roi_from_marker(corners_car[i], frame.shape, ROI_MARGIN)
+                        lost_count = 0
+
+                        phys_coord = get_bev_point(cx, cy, M_matrix)
+
+                        if phys_coord:
+                            car_x_cm, car_y_cm = phys_coord
+
+                            cv2.putText(frame,
+                                        f"X:{int(car_x_cm)}cm Y:{int(car_y_cm)}cm",
+                                        (int(cx) - 100, int(cy) - 30),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.5,
+                                        (0, 255, 255), 4)
+
+                            x_m = round(car_x_cm / 100.0, 3)
+                            z_m = round(car_y_cm / 100.0, 3)
+
+                            f_px = (c[3] + c[2]) / 2
+                            b_px = (c[0] + c[1]) / 2
+
+                            f_ph = get_bev_point(f_px[0], f_px[1], M_matrix)
+                            b_ph = get_bev_point(b_px[0], b_px[1], M_matrix)
+
+                            real_yaw = 0.0
+                            if f_ph and b_ph:
+                                real_yaw = round(
+                                    math.degrees(
+                                        math.atan2(
+                                            f_ph[0] - b_ph[0],
+                                            f_ph[1] - b_ph[1]
+                                        )
+                                    ),
+                                    2
+                                )
+
+                            if now - last_send_time >= SEND_INTERVAL:
+                                payload = {
+                                    "type": "robot_position",
+                                    "pos": [x_m, 0.16, z_m],
+                                    "euler": [0.0, real_yaw, 0.0],
+                                }
+
+                                try:
+                                    json_str = json.dumps(payload)
+                                    udp_socket.sendto(
+                                        json_str.encode("utf-8"),
+                                        (TARGET_IP, TARGET_PORT)
+                                    )
+                                    last_send_time = now
+
+                                    if now - last_print_time >= PRINT_INTERVAL:
+                                        print(
+                                            f"send: X:{x_m}m Z:{z_m}m "
+                                            f"Yaw:{real_yaw} FPS:{fps:.1f} "
+                                            f"Delay:{delay_ms:.0f}ms Mode:{scan_mode}"
+                                        )
+                                        last_print_time = now
+
+                                except Exception as e:
+                                    print(f"send failed: {e}")
+
+                        break
+
+            if not found_car:
+                lost_count += 1
+                if lost_count >= LOST_FULL_SCAN_AFTER:
+                    car_roi = None
+
+            cv2.putText(frame, f"Scan: {scan_mode} Lost:{lost_count}",
+                        (40, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                        (255, 180, 0), 3)
+
+        fps_count += 1
+        elapsed = now - fps_t0
+
+        if elapsed >= 1.0:
+            fps = fps_count / elapsed
+            fps_count = 0
+            fps_t0 = now
+
+        display_frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_AREA)
+
+        cv2.rectangle(display_frame, (10, 45), (205, 105), (0, 0, 0), -1)
+
+        cv2.putText(display_frame, f"FPS: {fps:.1f}", (18, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    (0, 255, 255), 2)
+
+        cv2.putText(display_frame, f"Delay: {delay_ms:.0f}ms", (18, 96),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 255, 255), 1)
+
+        draw_minimap_display(display_frame, car_x_cm, car_y_cm)
+
+        cv2.imshow("Auto BEV Tracker & Radar", display_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    camera.release()
+    udp_socket.close()
+    cv2.destroyAllWindows()
